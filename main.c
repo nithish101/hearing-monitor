@@ -1,0 +1,280 @@
+/*
+ * main.c - Hearing Strain Monitor: Entry Point & Display Loop
+ *
+ * ┌─────────────────────┐        ┌───────────────┐        ┌──────────────┐
+ * │  Audio Thread        │──dB──▶│ Shared Buffer  │──────▶│  Processing  │
+ * │  (producer, 1 Hz)   │        │  (mutex-locked)│        │  Thread      │
+ * └─────────────────────┘        └───────┬───────┘        └──────────────┘
+ *                                        │
+ *                                        ▼
+ *                                ┌───────────────┐
+ *                                │  Main Thread   │
+ *                                │  (display, 1s) │
+ *                                └───────────────┘
+ *
+ * This file:
+ *   1. Initializes the shared data and mutex
+ *   2. Spawns the audio producer and processing consumer threads
+ *   3. Runs a 1-second display loop that prints a real-time dashboard
+ *   4. On SIGINT (Ctrl-C), signals threads to stop and joins them
+ *
+ * Signal handling gives the program a clean shutdown path, which is
+ * important for demonstrating proper thread lifecycle management in
+ * interviews.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "shared.h"
+#include "audio.h"
+#include "processing.h"
+
+/* ── ANSI Color Codes ───────────────────────────────────────────────── */
+
+#define RESET       "\033[0m"
+#define BOLD        "\033[1m"
+#define DIM         "\033[2m"
+#define RED         "\033[31m"
+#define GREEN       "\033[32m"
+#define YELLOW      "\033[33m"
+#define CYAN        "\033[36m"
+#define WHITE       "\033[37m"
+#define BG_RED      "\033[41m"
+#define CLEAR_LINE  "\033[2K"
+
+/* ── Global shared state (so signal handler can reach it) ───────────── */
+
+static SharedData shared;
+
+/* ── Signal Handler ─────────────────────────────────────────────────── */
+
+/*
+ * handle_sigint - graceful shutdown on Ctrl-C
+ *
+ * Sets shared.running to 0 under mutex protection so that both worker
+ * threads see the flag and exit their loops on the next iteration.
+ */
+static void handle_sigint(int sig)
+{
+    (void)sig;  /* unused parameter */
+    pthread_mutex_lock(&shared.lock);
+    shared.running = 0;
+    pthread_mutex_unlock(&shared.lock);
+}
+
+/* ── Display Helpers ────────────────────────────────────────────────── */
+
+/*
+ * format_time - convert seconds to a human-readable string
+ *
+ * Outputs "Xh Ym Zs", "Ym Zs", or "Zs" depending on magnitude.
+ * If seconds >= INFINITY_TIME sentinel, returns "∞".
+ */
+static void format_time(float seconds, char *buf, size_t bufsize)
+{
+    if (seconds >= 99999.0f) {
+        snprintf(buf, bufsize, "  ∞");
+        return;
+    }
+    int s = (int)seconds;
+    int h = s / 3600;
+    int m = (s % 3600) / 60;
+    int sec = s % 60;
+
+    if (h > 0)
+        snprintf(buf, bufsize, "%dh %dm %ds", h, m, sec);
+    else if (m > 0)
+        snprintf(buf, bufsize, "%dm %ds", m, sec);
+    else
+        snprintf(buf, bufsize, "%ds", sec);
+}
+
+/*
+ * score_color - return ANSI color code based on strain severity
+ */
+static const char *score_color(float score)
+{
+    if (score >= ALERT_DANGER)  return RED;
+    if (score >= ALERT_WARNING) return YELLOW;
+    return GREEN;
+}
+
+/*
+ * db_color - return ANSI color code based on dB level
+ */
+static const char *db_color(float db)
+{
+    if (db >= 95.0f) return RED;
+    if (db >= 85.0f) return YELLOW;
+    return GREEN;
+}
+
+/*
+ * render_bar - draw a fixed-width progress bar
+ *
+ *   ████████████░░░░░░░░  (filled portion colored by severity)
+ */
+static void render_bar(float score, int width)
+{
+    int filled = (int)(score / 100.0f * width);
+    if (filled > width) filled = width;
+
+    const char *color = score_color(score);
+
+    printf("%s", color);
+    for (int i = 0; i < filled; i++)   printf("█");
+    printf(RESET DIM);
+    for (int i = filled; i < width; i++) printf("░");
+    printf(RESET);
+}
+
+/*
+ * print_dashboard - render the real-time monitoring display
+ *
+ * Layout (approx. 12 lines):
+ *
+ *   ╔══════════════════════════════════════════╗
+ *   ║     🎧  HEARING STRAIN MONITOR          ║
+ *   ╠══════════════════════════════════════════╣
+ *   ║  dB Level:   ██  85.3 dB                ║
+ *   ║  Strain:     ████████░░░░  52.1 / 100   ║
+ *   ║  Time Left:  7h 42m 15s                 ║
+ *   ╠══════════════════════════════════════════╣
+ *   ║  Status:  ⚠  MODERATE EXPOSURE          ║
+ *   ╚══════════════════════════════════════════╝
+ */
+static void print_dashboard(float db, float score, float time_left,
+                             float strain, int elapsed)
+{
+    (void)strain;  /* available for future use; score is the normalized view */
+
+    char time_buf[64];
+    format_time(time_left, time_buf, sizeof(time_buf));
+
+    char elapsed_buf[64];
+    format_time((float)elapsed, elapsed_buf, sizeof(elapsed_buf));
+
+    /* Move cursor to top-left and clear */
+    printf("\033[H\033[2J");
+
+    printf(BOLD CYAN "  ╔══════════════════════════════════════════════════╗\n");
+    printf("  ║          🎧  HEARING STRAIN MONITOR             ║\n");
+    printf("  ╠══════════════════════════════════════════════════╣" RESET "\n");
+
+    /* dB level */
+    printf("  ║  " DIM "dB Level:" RESET "    %s%-6.1f dB" RESET, db_color(db), db);
+    if (db >= 95.0f)       printf("   " RED "🔴 VERY LOUD" RESET);
+    else if (db >= 85.0f)  printf("   " YELLOW "🟡 LOUD" RESET);
+    else if (db >= 70.0f)  printf("   " GREEN "🟢 MODERATE" RESET);
+    else                   printf("   " DIM "🔵 QUIET" RESET);
+    printf("\n");
+
+    /* Strain bar */
+    printf("  ║  " DIM "Strain:" RESET "      ");
+    render_bar(score, 25);
+    printf("  %s%5.1f" RESET " / 100\n", score_color(score), score);
+
+    /* Time remaining */
+    printf("  ║  " DIM "Time Left:" RESET "   %s%-18s" RESET "\n",
+           score_color(score), time_buf);
+
+    /* Elapsed time */
+    printf("  ║  " DIM "Elapsed:" RESET "     %-18s\n", elapsed_buf);
+
+    printf(BOLD CYAN "  ╠══════════════════════════════════════════════════╣" RESET "\n");
+
+    /* Status line with alert */
+    printf("  ║  " DIM "Status:" RESET "  ");
+    if (score >= 100.0f) {
+        printf(BOLD BG_RED WHITE "  🛑  THRESHOLD REACHED — TAKE A BREAK  " RESET);
+    } else if (score >= ALERT_DANGER) {
+        printf(BOLD RED "  ⛔  DANGER — HIGH EXPOSURE  " RESET);
+    } else if (score >= ALERT_WARNING) {
+        printf(BOLD YELLOW "  ⚠   WARNING — MODERATE EXPOSURE  " RESET);
+    } else {
+        printf(BOLD GREEN "  ✅  SAFE — LOW EXPOSURE  " RESET);
+    }
+    printf("\n");
+
+    printf(BOLD CYAN "  ╚══════════════════════════════════════════════════╝" RESET "\n");
+
+    printf("\n" DIM "  Press Ctrl-C to stop monitoring." RESET "\n");
+
+    fflush(stdout);
+}
+
+/* ── Main ───────────────────────────────────────────────────────────── */
+
+int main(void)
+{
+    pthread_t audio_tid, proc_tid;
+
+    /* ── Seed random number generator ────────────────────────────── */
+    srand((unsigned)time(NULL));
+
+    /* ── Initialize shared data ──────────────────────────────────── */
+    memset(&shared, 0, sizeof(shared));
+    shared.running = 1;
+    pthread_mutex_init(&shared.lock, NULL);
+
+    /* ── Install signal handler for graceful shutdown ─────────────── */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigaction(SIGINT, &sa, NULL);
+
+    /* ── Spawn worker threads ────────────────────────────────────── */
+    if (pthread_create(&audio_tid, NULL, audio_thread_func, &shared) != 0) {
+        perror("pthread_create(audio)");
+        return 1;
+    }
+    if (pthread_create(&proc_tid, NULL, processing_thread_func, &shared) != 0) {
+        perror("pthread_create(processing)");
+        return 1;
+    }
+
+    printf("\033[?25l");  /* hide cursor for cleaner display */
+
+    /* ── Display loop (runs on main thread) ──────────────────────── */
+    int elapsed = 0;
+    while (1) {
+        float db, score, time_left, strain;
+
+        /* ── Read shared state under lock ─────────────────────────── */
+        pthread_mutex_lock(&shared.lock);
+        if (!shared.running) {
+            pthread_mutex_unlock(&shared.lock);
+            break;
+        }
+        db        = shared.db;
+        score     = shared.score;
+        time_left = shared.time_left;
+        strain    = shared.strain;
+        pthread_mutex_unlock(&shared.lock);
+        /* ── End critical section ─────────────────────────────────── */
+
+        print_dashboard(db, score, time_left, strain, elapsed);
+
+        usleep(DISPLAY_INTERVAL_US);
+        elapsed++;
+    }
+
+    /* ── Clean shutdown ──────────────────────────────────────────── */
+    printf("\033[?25h");   /* restore cursor */
+
+    pthread_join(audio_tid, NULL);
+    pthread_join(proc_tid, NULL);
+    pthread_mutex_destroy(&shared.lock);
+
+    printf("\n" BOLD CYAN "  Hearing Strain Monitor stopped." RESET "\n");
+    printf(DIM "  Final strain score: %.1f / 100\n" RESET, shared.score);
+    printf(DIM "  Total monitoring time: %d seconds\n" RESET, elapsed);
+
+    return 0;
+}
