@@ -42,6 +42,24 @@
 #define ALERT_WARNING   60.0f   /* score ≥ 60 → yellow warning   */
 #define ALERT_DANGER    80.0f   /* score ≥ 80 → red danger alert  */
 
+/* ── GPIO Pin Assignments (BCM numbering) ───────────────────────────── */
+
+#ifdef RASPBERRY_PI
+#define GPIO_LED_GREEN   17     /* green LED  → GPIO 17 (pin 11) */
+#define GPIO_LED_YELLOW  27     /* yellow LED → GPIO 27 (pin 13) */
+#define GPIO_LED_RED     22     /* red LED    → GPIO 22 (pin 15) */
+#define GPIO_BUZZER      23     /* piezo      → GPIO 23 (pin 16) */
+#endif
+
+/* ── ALSA Capture Settings ──────────────────────────────────────────── */
+
+#ifdef RASPBERRY_PI
+#define ALSA_DEVICE      "plughw:0,0"   /* I2S MEMS mic (card 0)  */
+#define ALSA_RATE        44100           /* sample rate in Hz      */
+#define ALSA_CHANNELS    1               /* mono capture           */
+#define ALSA_FRAMES      1024            /* frames per read cycle  */
+#endif
+
 /* ── Shared Data ────────────────────────────────────────────────────── */
 
 /*
