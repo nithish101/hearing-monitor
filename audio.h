@@ -2,8 +2,8 @@
  * audio.h - Audio input (producer) thread interface
  *
  * Declares the entry point for the audio sampling thread.
- * The thread continuously generates simulated dB readings and writes
- * them into the shared buffer under mutex protection.
+ * On Raspberry Pi builds, the thread reads from an I2S MEMS microphone
+ * via ALSA.  On other platforms, it generates simulated dB readings.
  */
 
 #ifndef AUDIO_H
@@ -18,7 +18,7 @@
  * @return      NULL on thread exit
  *
  * Behavior:
- *   1. Generate a simulated dB reading (60–100 range with smoothing)
+ *   1. Read dB from microphone (Pi) or generate simulated value
  *   2. Lock the mutex
  *   3. Write db + set updated flag
  *   4. Unlock the mutex
