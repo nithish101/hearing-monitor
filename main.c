@@ -11,16 +11,19 @@
  *                                │  Main Thread   │
  *                                │  (display, 1s) │
  *                                └───────────────┘
+ *                                        │
+ *                                        ▼
+ *                                ┌───────────────┐
+ *                                │  GPIO Output   │
+ *                                │  (LEDs/buzzer) │
+ *                                └───────────────┘
  *
  * This file:
- *   1. Initializes the shared data and mutex
+ *   1. Initializes the shared data, mutex, and GPIO (on Pi)
  *   2. Spawns the audio producer and processing consumer threads
  *   3. Runs a 1-second display loop that prints a real-time dashboard
+ *      and drives GPIO indicators
  *   4. On SIGINT (Ctrl-C), signals threads to stop and joins them
- *
- * Signal handling gives the program a clean shutdown path, which is
- * important for demonstrating proper thread lifecycle management in
- * interviews.
  */
 
 #include <stdio.h>
@@ -34,6 +37,7 @@
 #include "shared.h"
 #include "audio.h"
 #include "processing.h"
+#include "gpio.h"
 
 /* ── ANSI Color Codes ───────────────────────────────────────────────── */
 
@@ -62,7 +66,7 @@ static SharedData shared;
  */
 static void handle_sigint(int sig)
 {
-    (void)sig;  /* unused parameter */
+    (void)sig;
     pthread_mutex_lock(&shared.lock);
     shared.running = 0;
     pthread_mutex_unlock(&shared.lock);
@@ -70,12 +74,6 @@ static void handle_sigint(int sig)
 
 /* ── Display Helpers ────────────────────────────────────────────────── */
 
-/*
- * format_time - convert seconds to a human-readable string
- *
- * Outputs "Xh Ym Zs", "Ym Zs", or "Zs" depending on magnitude.
- * If seconds >= INFINITY_TIME sentinel, returns "∞".
- */
 static void format_time(float seconds, char *buf, size_t bufsize)
 {
     if (seconds >= 99999.0f) {
@@ -95,9 +93,6 @@ static void format_time(float seconds, char *buf, size_t bufsize)
         snprintf(buf, bufsize, "%ds", sec);
 }
 
-/*
- * score_color - return ANSI color code based on strain severity
- */
 static const char *score_color(float score)
 {
     if (score >= ALERT_DANGER)  return RED;
@@ -105,9 +100,6 @@ static const char *score_color(float score)
     return GREEN;
 }
 
-/*
- * db_color - return ANSI color code based on dB level
- */
 static const char *db_color(float db)
 {
     if (db >= 95.0f) return RED;
@@ -115,11 +107,6 @@ static const char *db_color(float db)
     return GREEN;
 }
 
-/*
- * render_bar - draw a fixed-width progress bar
- *
- *   ████████████░░░░░░░░  (filled portion colored by severity)
- */
 static void render_bar(float score, int width)
 {
     int filled = (int)(score / 100.0f * width);
@@ -134,38 +121,26 @@ static void render_bar(float score, int width)
     printf(RESET);
 }
 
-/*
- * print_dashboard - render the real-time monitoring display
- *
- * Layout (approx. 12 lines):
- *
- *   ╔══════════════════════════════════════════╗
- *   ║     🎧  HEARING STRAIN MONITOR          ║
- *   ╠══════════════════════════════════════════╣
- *   ║  dB Level:   ██  85.3 dB                ║
- *   ║  Strain:     ████████░░░░  52.1 / 100   ║
- *   ║  Time Left:  7h 42m 15s                 ║
- *   ╠══════════════════════════════════════════╣
- *   ║  Status:  ⚠  MODERATE EXPOSURE          ║
- *   ╚══════════════════════════════════════════╝
- */
-static void print_dashboard(float db, float score, float time_left,
-                             float strain, int elapsed)
+static void print_dashboard(float db, float score, float time_left, int elapsed)
 {
-    (void)strain;  /* available for future use; score is the normalized view */
-
     char time_buf[64];
     format_time(time_left, time_buf, sizeof(time_buf));
 
     char elapsed_buf[64];
     format_time((float)elapsed, elapsed_buf, sizeof(elapsed_buf));
 
-    /* Move cursor to top-left and clear */
     printf("\033[H\033[2J");
 
     printf(BOLD CYAN "  ╔══════════════════════════════════════════════════╗\n");
     printf("  ║          🎧  HEARING STRAIN MONITOR             ║\n");
     printf("  ╠══════════════════════════════════════════════════╣" RESET "\n");
+
+    /* Input mode indicator */
+#ifdef RASPBERRY_PI
+    printf("  ║  " DIM "Mode:" RESET "        " CYAN "I2S MEMS Microphone" RESET "\n");
+#else
+    printf("  ║  " DIM "Mode:" RESET "        " DIM "Simulation" RESET "\n");
+#endif
 
     /* dB level */
     printf("  ║  " DIM "dB Level:" RESET "    %s%-6.1f dB" RESET, db_color(db), db);
@@ -215,13 +190,17 @@ int main(void)
 {
     pthread_t audio_tid, proc_tid;
 
-    /* ── Seed random number generator ────────────────────────────── */
     srand((unsigned)time(NULL));
 
     /* ── Initialize shared data ──────────────────────────────────── */
     memset(&shared, 0, sizeof(shared));
     shared.running = 1;
     pthread_mutex_init(&shared.lock, NULL);
+
+    /* ── Initialize GPIO (no-op on non-Pi) ───────────────────────── */
+    if (gpio_init() != 0) {
+        fprintf(stderr, "warning: GPIO init failed, continuing without hardware indicators\n");
+    }
 
     /* ── Install signal handler for graceful shutdown ─────────────── */
     struct sigaction sa;
@@ -232,21 +211,22 @@ int main(void)
     /* ── Spawn worker threads ────────────────────────────────────── */
     if (pthread_create(&audio_tid, NULL, audio_thread_func, &shared) != 0) {
         perror("pthread_create(audio)");
+        gpio_shutdown();
         return 1;
     }
     if (pthread_create(&proc_tid, NULL, processing_thread_func, &shared) != 0) {
         perror("pthread_create(processing)");
+        gpio_shutdown();
         return 1;
     }
 
-    printf("\033[?25l");  /* hide cursor for cleaner display */
+    printf("\033[?25l");  /* hide cursor */
 
     /* ── Display loop (runs on main thread) ──────────────────────── */
     int elapsed = 0;
     while (1) {
-        float db, score, time_left, strain;
+        float db, score, time_left;
 
-        /* ── Read shared state under lock ─────────────────────────── */
         pthread_mutex_lock(&shared.lock);
         if (!shared.running) {
             pthread_mutex_unlock(&shared.lock);
@@ -255,11 +235,12 @@ int main(void)
         db        = shared.db;
         score     = shared.score;
         time_left = shared.time_left;
-        strain    = shared.strain;
         pthread_mutex_unlock(&shared.lock);
-        /* ── End critical section ─────────────────────────────────── */
 
-        print_dashboard(db, score, time_left, strain, elapsed);
+        print_dashboard(db, score, time_left, elapsed);
+
+        /* ── Drive GPIO indicators ───────────────────────────────── */
+        gpio_update(score);
 
         usleep(DISPLAY_INTERVAL_US);
         elapsed++;
@@ -271,6 +252,8 @@ int main(void)
     pthread_join(audio_tid, NULL);
     pthread_join(proc_tid, NULL);
     pthread_mutex_destroy(&shared.lock);
+
+    gpio_shutdown();
 
     printf("\n" BOLD CYAN "  Hearing Strain Monitor stopped." RESET "\n");
     printf(DIM "  Final strain score: %.1f / 100\n" RESET, shared.score);
