@@ -4,6 +4,17 @@ Tracks cumulative hearing strain in real time by measuring ambient sound levels 
 
 Runs on a Raspberry Pi with an I2S MEMS microphone for live audio capture, or on any POSIX system in simulation mode for development and testing.
 
+![Terminal dashboard in simulation mode: 87.4 dB marked LOUD, strain 0.3 / 100, 7h 47m left, status SAFE, low exposure](docs/screenshots/terminal.png)
+
+<details>
+<summary>20 seconds of the live dashboard (simulation mode)</summary>
+
+![The dashboard updating once per second as the simulated level moves between moderate and loud](docs/screenshots/simulation.gif)
+
+</details>
+
+Captured from `make && ./hearing_monitor` on macOS.
+
 ## Hardware
 
 ### Components
